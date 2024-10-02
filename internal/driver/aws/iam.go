@@ -2,12 +2,15 @@ package aws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/olekukonko/tablewriter"
@@ -36,9 +39,14 @@ func (i *IamDriver) ListUsers() error {
 	for _, user := range output.Users {
 		isConsoleActive := false
 		consoleStatus := "false"
-		mfaEnabled := "false"
+		mfaEnabled := ""
 		message := ""
-
+		passwordLastUser := ""
+		if user.PasswordLastUsed != nil {
+			passwordLastUser = user.PasswordLastUsed.Format(time.RFC3339)
+		} else {
+			passwordLastUser = "this user has never used password"
+		}
 		// Check if the user has a console login profile
 		loginProfileOutput, err := i.client.GetLoginProfile(context.Background(), &iam.GetLoginProfileInput{
 			UserName: user.UserName,
@@ -46,7 +54,7 @@ func (i *IamDriver) ListUsers() error {
 		if err != nil {
 			message = fmt.Sprintf("Error getting login profile for user %s: %v\n", *user.UserName, err)
 		} else {
-			if loginProfileOutput.LoginProfile.CreateDate == nil {
+			if loginProfileOutput.LoginProfile.CreateDate != nil {
 				// If no error, console login profile exists
 				isConsoleActive = true
 				consoleStatus = "true"
@@ -58,23 +66,27 @@ func (i *IamDriver) ListUsers() error {
 			}
 		}
 
-		mfaOutput, err := i.client.GetMFADevice(context.Background(), &iam.GetMFADeviceInput{
+		mfaOutput, err := i.client.ListMFADevices(context.Background(), &iam.ListMFADevicesInput{
 			UserName: user.UserName,
 		})
 		if err != nil {
 			message = message + fmt.Sprintf("; Error getting MFA device for user %s: %v\n", *user.UserName, err)
 		} else {
-			if mfaOutput.EnableDate == nil && isConsoleActive {
-				message = message + "; No MFA device attached"
+			for _, mfa := range mfaOutput.MFADevices {
+				if mfa.EnableDate == nil && isConsoleActive {
+					message = message + "No MFA device; \n"
+				} else {
+					msg := *mfa.SerialNumber + "(true)\n"
+					mfaEnabled = mfaEnabled + msg
+				}
 			}
-			mfaEnabled = "true"
 		}
 
 		// Append row to the table
 		table.Append([]string{
 			*user.UserName,
 			user.CreateDate.Format(time.RFC3339),
-			user.PasswordLastUsed.Format(time.RFC3339),
+			passwordLastUser,
 			consoleStatus,
 			mfaEnabled,
 			message,
@@ -95,18 +107,34 @@ func (i *IamDriver) ListGroups() error {
 	// Create a new table writer
 	fmt.Println("\n-----Start Checking Groups-----")
 	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"GroupID", "GroupName", "Users", "CreateDate", "Message"})
+	table.SetHeader([]string{"GroupID", "GroupName", "CreateDate", "Users", "Message"})
 	for _, group := range output.Groups {
 		var m string = ""
-		gOutput, err := i.client.GetGroup(context.Background(), &iam.GetGroupInput{})
+		groupUserCount := 0
+		groupCreateDated := "NONE"
+		gOutput, err := i.client.GetGroup(context.Background(), &iam.GetGroupInput{
+			GroupName: group.GroupName,
+		})
 		if err != nil {
 			m = fmt.Sprintf("Error getting group %s: %v\n", *group.GroupName, err)
 		} else {
-			if len(gOutput.Users) == 0 {
+
+			if gOutput.Users == nil {
 				m = "No users in the group"
+			} else {
+				groupUserCount = len(gOutput.Users)
+			}
+
+			if gOutput.Group.CreateDate != nil {
+				groupCreateDated = gOutput.Group.CreateDate.Format(time.RFC3339)
 			}
 		}
-		table.Append([]string{*group.GroupId, *group.GroupName, fmt.Sprintf("%d", len(gOutput.Users)), gOutput.Group.CreateDate.String(), m})
+		table.Append([]string{
+			*group.GroupId,
+			*group.GroupName,
+			groupCreateDated,
+			fmt.Sprintf("%d", groupUserCount),
+			m})
 	}
 	table.Render()
 	fmt.Println("\n-----End Checking Groups-----")
@@ -180,9 +208,19 @@ func (i *IamDriver) CheckingSoureIpForConsole() error {
 
 func (i *IamDriver) CheckPasswordPolicy() error {
 	fmt.Println("\n-----Start Checking Password Policy-----")
+	defer func() {
+		fmt.Println("\n-----End Checking Password Policy-----")
+	}()
 	output, err := i.client.GetAccountPasswordPolicy(context.Background(), &iam.GetAccountPasswordPolicyInput{})
+	var re *awshttp.ResponseError
 	if err != nil {
-		return err
+		if errors.As(err, &re) {
+			if re.ResponseError.HTTPStatusCode() == 404 {
+				fmt.Println("Password policy not found")
+			}
+			return nil
+		}
+		return nil
 	}
 	if *output.PasswordPolicy.MinimumPasswordLength < 8 {
 		fmt.Println("Password length is greater than 8")
@@ -211,7 +249,7 @@ func (i *IamDriver) CheckPasswordPolicy() error {
 	if !output.PasswordPolicy.AllowUsersToChangePassword {
 		fmt.Println("Allow users to change password is disabled, please change to true")
 	}
-	fmt.Println("\n-----End Checking Password Policy-----")
+
 	return nil
 }
 

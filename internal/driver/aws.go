@@ -65,9 +65,9 @@ func (a *AwsManager) CheckIam() error {
 		return err
 	}
 
-	if err := a.iamClient.ListAccessKey(); err != nil {
-		return err
-	}
+	// if err := a.iamClient.ListAccessKey(); err != nil {
+	// 	return err
+	// }
 
 	if err := a.iamClient.CheckingSoureIpForConsole(); err != nil {
 		return err
